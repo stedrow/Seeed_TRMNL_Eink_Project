@@ -298,7 +298,8 @@ void ReduceBpp(int iDestBpp, int iPixelType, uint8_t *pPalette, uint8_t *pSrc, u
 {
     int g = 0, x, iDelta;
     uint8_t *s, *d, *pPal, u8, count;
-    
+    const uint8_t u8G2ToG8[4] = {0x00, 0x55, 0xaa, 0xff}; // 2-bit to 8-bit gray
+
     if (iPixelType == PNG_PIXEL_TRUECOLOR) iSrcBpp = 24;
     else if (iPixelType == PNG_PIXEL_TRUECOLOR_ALPHA) iSrcBpp = 32;
     iDelta = iSrcBpp/8; // bytes per pixel
@@ -343,8 +344,15 @@ void ReduceBpp(int iDestBpp, int iPixelType, uint8_t *pPalette, uint8_t *pSrc, u
                 break;
             case 2: // We need to handle this case for 2-bit images with (random) palettes
                 g = s[0] >> (6-((x & 3) * 2));
-                pPal = &pPalette[(g & 3)*3];
-                g = (pPal[0] + pPal[1]*2 + pPal[2])/4;
+                if (iPixelType == PNG_PIXEL_INDEXED) {
+                    pPal = &pPalette[(g & 3)*3];
+                    g = (pPal[0] + pPal[1]*2 + pPal[2])/4;
+                } else {
+                    g = u8G2ToG8[g & 3];
+                }
+                if ((x & 3) == 3) {
+                    s++;
+                }
                 break;
         } // switch on bpp
         if (iDestBpp == 1) {
@@ -775,7 +783,7 @@ void display_show_image(uint8_t *image_buffer, int data_size, bool bWait)
     int iRefreshMode = REFRESH_FULL; // assume full (slow) refresh
 
    // Log_info("Paint_NewImage %d", reverse);
-    Log_info("show image for array");
+    Log_info("display_show_image start");
     Log_info("maximum_compatibility = %d\n", apiDisplayResult.response.maximum_compatibility);
 #ifdef FUTURE
     if (reverse)
@@ -864,7 +872,7 @@ void display_show_image(uint8_t *image_buffer, int data_size, bool bWait)
 #else
     bbep.fullUpdate();
 #endif
-    Log_info("display refresh end");
+    Log_info("display_show_image end");
 }
 /**
  * @brief Function to read an image from the file system
@@ -907,8 +915,7 @@ void display_show_msg(uint8_t *image_buffer, MSG message_type)
     UWORD Imagesize = ((width % 8 == 0) ? (width / 8) : (width / 8 + 1)) * height;
     BB_RECT rect;
 
-    Log_info("Paint_NewImage");
-    Log_info("show image for array");
+    Log_info("display_show_msg start");
     Log_info("maximum_compatibility = %d\n", apiDisplayResult.response.maximum_compatibility);
 #ifdef BB_EPAPER
     bbep.allocBuffer(false);
@@ -1096,7 +1103,7 @@ void display_show_msg(uint8_t *image_buffer, MSG message_type)
 #else
     bbep.fullUpdate();
 #endif
-    Log_info("display");
+    Log_info("display_show_msg end");
 }
 
 /**
@@ -1122,6 +1129,7 @@ void display_show_msg(uint8_t *image_buffer, MSG message_type, String friendly_i
     if (message_type == WIFI_CONNECT)
     {
         Log_info("Display set to white");
+        bbep.fillScreen(BBEP_WHITE);
 #ifdef BB_EPAPER
         bbep.writePlane(PLANE_0);
         if (!apiDisplayResult.response.maximum_compatibility) {
@@ -1141,8 +1149,7 @@ void display_show_msg(uint8_t *image_buffer, MSG message_type, String friendly_i
     UWORD Imagesize = ((width % 8 == 0) ? (width / 8) : (width / 8 + 1)) * height;
     BB_RECT rect;
 
-    Log_info("Paint_NewImage");
-    Log_info("show image for array");
+    Log_info("display_show_msg2 start");
 
     // Load the image into the bb_epaper framebuffer
     if (*(uint16_t *)image_buffer == BB_BITMAP_MARKER)
@@ -1224,7 +1231,7 @@ void display_show_msg(uint8_t *image_buffer, MSG message_type, String friendly_i
 #else
     bbep.fullUpdate();
 #endif
-    Log_info("display");
+    Log_info("display_show_msg2 end");
 }
 
 /**
