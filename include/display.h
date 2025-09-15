@@ -84,6 +84,14 @@ void Paint_DrawMultilineText(UWORD x_start, UWORD y_start, const char *message,
 void display_show_image(uint8_t *image_buffer, int data_size, bool bWait);
 
 /**
+ * @brief E1002-specific test function to validate color mapping
+ * @note This function tests the 7-color capabilities of the E1002 display
+ */
+#if defined(BOARD_SEEED_RETERMINAL_E1002)
+void test_e1002_color_mapping();
+#endif
+
+/**
  * @brief Function to read an image from the file system
  * @param filename
  * @param pointer to file size returned
