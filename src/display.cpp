@@ -72,11 +72,7 @@ private:
     static int16_t cursorY;
     static bool inPagedMode;
 
-    // PNG image data storage
-    static std::vector<uint8_t> imageData;
-    static int imageWidth;
-    static int imageHeight;
-    static int currentImageLine;
+    // PNG image data storage (simplified for direct rendering)
     static bool hasImageData;
 
     // Structure to store drawing commands for paged rendering
@@ -95,37 +91,13 @@ public:
     }
 
     static void writeData(uint8_t* data, size_t len) {
-        // Capture PNG image data line by line
-        // This is called during PNG decoding (from png_draw_into_4bpp)
-        if (data && len > 0) {
-            // Append the line data to our image buffer
-            size_t currentSize = imageData.size();
-            imageData.resize(currentSize + len);
-            memcpy(&imageData[currentSize], data, len);
-            currentImageLine++;
-            hasImageData = true;
-            
-            // Debug: Log every 10th line to avoid spam
-            if (currentImageLine % 10 == 0) {
-                Log_info("E1002: Captured line %d, total data: %d bytes", currentImageLine, imageData.size());
-            }
-        }
+        // Not used in direct rendering approach
+        (void)data; (void)len; // Suppress unused warnings
     }
 
     static void writeCmd(uint8_t cmd) {
-        // Low-level commands for direct display control
-        // For E1002, detect when PNG decoding starts to prepare image capture
-        if (cmd == 0x10) { // DATA_START_TRANSMISSION_1
-            // Reset image data capture for new image
-            Log_info("E1002: Starting image data capture (cmd=0x%02X)", cmd);
-            imageData.clear();
-            imageData.reserve(display.width() * display.height() / 2); // 4bpp = 0.5 bytes per pixel
-            currentImageLine = 0;
-            imageWidth = display.width();
-            imageHeight = display.height();
-            hasImageData = false;
-            Log_info("E1002: Image capture prepared for %dx%d display", imageWidth, imageHeight);
-        }
+        // Not used in direct rendering approach
+        (void)cmd; // Suppress unused warning
     }
 
     static uint16_t width() { return display.width(); }
@@ -269,22 +241,6 @@ public:
             // Clear screen
             display.fillScreen(GxEPD_WHITE);
 
-            // If we have PNG image data, render it first
-            if (hasImageData && !imageData.empty()) {
-                // For 7-color displays, we need to use drawBitmap or similar method
-                // The imageData contains 4bpp data that needs to be converted to GxEPD2 format
-                Log_info("E1002: Rendering captured image data (%d bytes)", imageData.size());
-                
-                // For now, let's try a simple approach - draw a test pattern to verify the display works
-                display.fillRect(10, 10, 100, 100, GxEPD_BLACK);
-                display.fillRect(120, 10, 100, 100, GxEPD_RED);
-                display.fillRect(10, 120, 100, 100, GxEPD_BLUE);
-                display.fillRect(120, 120, 100, 100, GxEPD_GREEN);
-                
-                // TODO: Implement proper 4bpp to GxEPD2 color conversion
-                // This would involve mapping the 4bpp data to the 7-color palette
-            }
-
             // Execute any buffered drawing commands (text overlays)
             display.setFont(&FreeMonoBold9pt7b);
             for (const auto& cmd : drawCommands) {
@@ -295,19 +251,12 @@ public:
                 }
             }
 
-            // If we have a buffer with image data, draw it
-            if (buffer && bufferAllocated) {
-                // TODO: Render buffer content to display
-                // This would involve converting 1-bpp buffer to GxEPD2 format
-            }
-
         } while (display.nextPage());
 
         inPagedMode = false;
 
-        // Clear draw commands and image data after rendering
+        // Clear draw commands after rendering
         drawCommands.clear();
-        imageData.clear();
         hasImageData = false;
     }
 
@@ -343,11 +292,7 @@ int16_t E1002DisplayWrapper::cursorY = 0;
 bool E1002DisplayWrapper::inPagedMode = false;
 std::vector<E1002DisplayWrapper::DrawCommand> E1002DisplayWrapper::drawCommands;
 
-// PNG image data storage static members
-std::vector<uint8_t> E1002DisplayWrapper::imageData;
-int E1002DisplayWrapper::imageWidth = 0;
-int E1002DisplayWrapper::imageHeight = 0;
-int E1002DisplayWrapper::currentImageLine = 0;
+// PNG image data storage static members (simplified)
 bool E1002DisplayWrapper::hasImageData = false;
 
 // Create a bbep-like object for E1002 code compatibility
@@ -973,130 +918,7 @@ PNG *png = new PNG();
     return rc;
 } /* png_to_epd() */
 
-/**
- * @brief E1002-specific PNG processing for 7-color display
- * @param pDraw PNG draw context
- * @return 1 on success, 0 on failure
- * @note This function processes PNG data specifically for the E1002's
- *       7-color Spectra 6 e-ink display (black, white, yellow, red, blue, green, orange)
- */
-#if defined(BOARD_SEEED_RETERMINAL_E1002)
-int png_draw_into_4bpp(PNGDRAW *pDraw)
-{
-    int x;
-    uint8_t ucBppChanged = 0, ucInvert = 0;
-    uint8_t uc, ucMask, src, *s, *d, *pReduced, *pTemp = bbep.getCache(); // get some scratch memory (not from the stack)
-    
-    // Enhanced color mapping using all 6 available colors
-    uint8_t colorMap[E1002_COLOR_MAP_SIZE] = {0x0, 0x1, 0x2, 0x3, 0x4, 0x5}; // All 6 colors
-    // Map: 0=black, 1=white, 2=yellow, 3=red, 4=blue, 5=green
-
-    // Add error checking for cache memory
-    if (!pTemp) {
-        Log_error("E1002: Failed to get cache memory for color processing");
-        return 0;
-    }
-
-    Log_verbose_serial("E1002: Processing %d-bpp PNG, pixel type: %d", pDraw->iBpp, pDraw->iPixelType);
-
-    if (pDraw->iPixelType == PNG_PIXEL_INDEXED || pDraw->iBpp > 2) {
-        if (pDraw->iBpp == 1) { // 1-bit output, just see which color is brighter
-            uint32_t u32Gray0, u32Gray1;
-            u32Gray0 = pDraw->pPalette[0] + (pDraw->pPalette[1]<<2) + pDraw->pPalette[2];
-            u32Gray1 = pDraw->pPalette[3] + (pDraw->pPalette[4]<<2) + pDraw->pPalette[5];
-          if (u32Gray0 < u32Gray1) {
-            ucInvert = 0xff;
-          }
-        } else {
-            // Reduce the source image to 1-bpp or 2-bpp
-            pReduced = (uint8_t *)calloc(E1002_COLOR_CACHE_SIZE, sizeof(uint8_t));
-            if (!pReduced) {
-                Log_error("E1002: Failed to allocate memory for color reduction");
-                return 0;
-            }
-            ReduceBpp(1, pDraw->iPixelType, pDraw->pPalette, pDraw->pPixels, pReduced, pDraw->iWidth, pDraw->iBpp);
-            ReduceBpp(2, pDraw->iPixelType, pDraw->pPalette, pDraw->pPixels, pReduced, pDraw->iWidth, pDraw->iBpp);
-            ucBppChanged = 1;
-        }
-    } else if (pDraw->iBpp == 2) {
-        ucInvert = 0xff; // 2-bit non-palette images need to be inverted colors for 4-gray mode
-    }
-    s = (ucBppChanged) ? pReduced : (uint8_t *)pDraw->pPixels;
-    d = pTemp;
-    if (!pDraw->pUser) {
-        // 1-bit output, decode the single plane and write it
-        ucInvert = ~ucInvert; // the b/w polarity is reversed compared to 2-bpp mode
-        src = *s++;
-        src ^= ucInvert;
-        uc = 0;
-        for(x = 0; x < pDraw->iWidth; x++) {
-            uc <<= 4;
-            if (src & 0x80) {
-                uc |= 0x0;  // black
-            } else {
-                uc |= 0x1;  // white
-            }
-            src <<= 1;
-            if ((x & 7) == 7) {
-                src = *s++; 
-                src ^= ucInvert;
-            }
-            if ((x & 1) == 1) {
-                *d++ = uc;
-                uc = 0;
-            }
-        }
-    } else { // we need to split the 2-bit data into plane 0 and 1
-        src = *s++;
-        src ^= ucInvert;
-        uc = 0; // suppress warning/error
-        if (*(int *)pDraw->pUser > 1) { // draw 2bpp data as 1-bit to use for partial update
-            ucInvert = ~ucInvert; // the invert rule is backwards for grayscale data
-            src = ~src;
-            for (x=0; x<pDraw->iWidth; x++) {
-                uc <<= 4;
-                if (src & 0xc0) { // non-white -> black
-                    uc |= 0x0;
-                } else {
-                    uc |= 0x1; // white
-                }
-                src <<= 2;
-                if ((x & 3) == 3) { // new input byte
-                    src = *s++;
-                    src ^= ucInvert;
-                }
-                if ((x & 1) == 1) { // new output byte
-                    *d++ = uc;
-                    uc = 0;
-                }
-            } // for x
-        } else { // normal 0/1 split plane
-            for (x=0; x<pDraw->iWidth; x++) {
-                uc <<= 4;
-                uc |= (colorMap[(src & 0xc0) >> 6]) & 0xf;
-                src <<= 2;
-                if ((x & 3) == 3) { // new input byte
-                    src = *s++;
-                    src ^= ucInvert;
-                }
-                if ((x & 1) == 1) { // new output byte
-                    *d++ = uc;
-                    uc = 0;
-                }
-            } // for x
-        }
-    }
-
-    // Safe memory cleanup
-    if (ucBppChanged && pReduced) {
-        free(pReduced);
-        pReduced = nullptr; // Prevent double-free
-    }
-    
-    bbep.writeData(pTemp, (pDraw->iWidth + 1) / 2);
-    Log_verbose_serial("E1002: Color processing completed successfully");
-    return 1;
-} /* png_draw() */
+// Removed png_draw_into_4bpp - using GxEPD2 approach instead
 
 int png_to_7color_epd(const uint8_t *pPNG, int iDataSize)
 {
@@ -1105,23 +927,20 @@ int png_to_7color_epd(const uint8_t *pPNG, int iDataSize)
 
     if (!png) {
         Log_error("E1002: Failed to allocate PNG decoder instance");
-        return PNG_MEM_ERROR; // not enough memory for the decoder instance
+        return PNG_MEM_ERROR;
     }
     
-    rc = png->openRAM((uint8_t *)pPNG, iDataSize, png_draw_to_gxepd2);
+    rc = png->openRAM((uint8_t *)pPNG, iDataSize, png_draw_to_buffer);
     if (rc == PNG_SUCCESS) {
         Log_info("E1002: Decoding %d-bpp PNG (%dx%d) for 6-color display", 
                 png->getBpp(), png->getWidth(), png->getHeight());
         
-        // TRMNL provides well-formatted images, so we can render them directly
         int imgWidth = png->getWidth();
         int imgHeight = png->getHeight();
-        int displayWidth = display.width();
-        int displayHeight = display.height();
         
-        // Simple centering without complex scaling
-        int offsetX = (displayWidth - imgWidth) / 2;
-        int offsetY = (displayHeight - imgHeight) / 2;
+        // Center the image on the display
+        int offsetX = (display.width() - imgWidth) / 2;
+        int offsetY = (display.height() - imgHeight) / 2;
         
         // Ensure image fits on display
         if (offsetX < 0) offsetX = 0;
@@ -1133,25 +952,15 @@ int png_to_7color_epd(const uint8_t *pPNG, int iDataSize)
         // Set up global rendering parameters
         g_png_offset_x = offsetX;
         g_png_offset_y = offsetY;
-        g_png_scale = 1; // No scaling needed for TRMNL images
+        g_png_scale = 1;
         g_png_rendering = true;
         
-        // For PNG images, let's use a simpler approach that doesn't cause rendering issues
-        // We'll decode the PNG once and store it, then render it in the paged loop
-        Log_info("E1002: Using simplified PNG rendering approach");
-        
-        display.setFullWindow();
-        display.firstPage();
-        
-        // The correct GxEPD2 approach for multi-color: Decode once, render in paged mode
-        // We need to decode the PNG to a buffer first, then render it in the paged loop
-        
-        Log_info("E1002: Using buffer-based multi-color PNG rendering");
-        
-        // Allocate buffer for the decoded image
+        // Decode PNG to framebuffer first (only once, outside paged loop)
         uint16_t *imageBuffer = (uint16_t*)malloc(imgWidth * imgHeight * sizeof(uint16_t));
         if (!imageBuffer) {
             Log_error("E1002: Failed to allocate image buffer");
+            png->close();
+            free(png);
             return -1;
         }
         
@@ -1161,12 +970,11 @@ int png_to_7color_epd(const uint8_t *pPNG, int iDataSize)
         g_buffer_height = imgHeight;
         g_png_rendering = true;
         
-        // Decode PNG to buffer (this happens once)
-        Log_info("E1002: Decoding PNG to buffer...");
-        png->openRAM((uint8_t *)pPNG, iDataSize, png_draw_to_buffer);
+        // Decode PNG to framebuffer (this happens once, outside paged loop)
+        Log_info("E1002: Decoding PNG to framebuffer...");
         png->decode(NULL, 0);
         
-        // Now render the buffer in paged mode
+        // Now render the framebuffer using GxEPD2's paged drawing
         display.setFullWindow();
         display.firstPage();
         
@@ -1174,7 +982,7 @@ int png_to_7color_epd(const uint8_t *pPNG, int iDataSize)
             // Clear screen
             display.fillScreen(GxEPD_WHITE);
             
-            // Render the decoded image buffer pixel by pixel
+            // Render the framebuffer pixel by pixel
             for (int y = 0; y < imgHeight; y++) {
                 for (int x = 0; x < imgWidth; x++) {
                     uint16_t color = imageBuffer[y * imgWidth + x];
@@ -1189,11 +997,12 @@ int png_to_7color_epd(const uint8_t *pPNG, int iDataSize)
         g_png_rendering = false;
         g_image_buffer = nullptr;
         
-        Log_info("E1002: PNG rendered using proper GxEPD2 drawBitmap");
-        rc = REFRESH_FULL; // this panel doesn't support partial update
+        g_png_rendering = false;
+        Log_info("E1002: PNG rendered using GxEPD2 approach");
+        rc = REFRESH_FULL;
     }
     png->close();
-    free(png); // free the decoder instance
+    free(png);
     return rc;
 } /* png_to_7color_epd() */
 
@@ -1203,6 +1012,7 @@ int png_to_7color_epd(const uint8_t *pPNG, int iDataSize)
  * @note This function creates a virtual BMP header for E1002's 7-color display
  *       and processes the image data for optimal color rendering
  */
+#if defined(BOARD_SEEED_RETERMINAL_E1002)
 static void draw_virtual_bmp_from_png(const uint8_t *image_buffer)
 {
     // Add error checking
@@ -1277,6 +1087,14 @@ uint16_t rgb_to_e1002_color(uint8_t r, uint8_t g, uint8_t b) {
         {0, 255, 0, GxEPD_GREEN}     // Green
     };
     
+    // Debug: Log color constants only once
+    static bool colors_logged = false;
+    if (!colors_logged) {
+        Log_info("E1002: Color constants - BLACK:0x%04X WHITE:0x%04X RED:0x%04X YELLOW:0x%04X BLUE:0x%04X GREEN:0x%04X",
+                GxEPD_BLACK, GxEPD_WHITE, GxEPD_RED, GxEPD_YELLOW, GxEPD_BLUE, GxEPD_GREEN);
+        colors_logged = true;
+    }
+    
     int bestMatch = 0;
     int minDistance = INT_MAX;
     
@@ -1307,92 +1125,8 @@ int png_draw_to_gxepd2(PNGDRAW *pDraw) {
     uint8_t *pixels = (uint8_t *)pDraw->pPixels;
     int y = pDraw->y;
     
-    // Calculate Y coordinate (no scaling for TRMNL images)
+    // Calculate Y coordinate
     int pixelY = g_png_offset_y + y;
-    
-    // Debug: Log every 100th line to avoid spam
-    if (y % 100 == 0) {
-        Log_info("E1002: Processing PNG line %d, width=%d", y, pDraw->iWidth);
-    }
-    
-    // Process pixels in chunks to improve performance
-    for (int x = 0; x < pDraw->iWidth; x += 2) { // Process 2 pixels at a time
-        uint8_t r1, g1, b1, r2, g2, b2;
-        
-        // Extract RGB values for first pixel
-        if (pDraw->iPixelType == PNG_PIXEL_TRUECOLOR) {
-            r1 = pixels[x * 3];
-            g1 = pixels[x * 3 + 1];
-            b1 = pixels[x * 3 + 2];
-        } else if (pDraw->iPixelType == PNG_PIXEL_TRUECOLOR_ALPHA) {
-            r1 = pixels[x * 4];
-            g1 = pixels[x * 4 + 1];
-            b1 = pixels[x * 4 + 2];
-        } else if (pDraw->iPixelType == PNG_PIXEL_INDEXED) {
-            int paletteIndex = pixels[x];
-            r1 = pDraw->pPalette[paletteIndex * 3];
-            g1 = pDraw->pPalette[paletteIndex * 3 + 1];
-            b1 = pDraw->pPalette[paletteIndex * 3 + 2];
-        } else {
-            r1 = g1 = b1 = pixels[x];
-        }
-        
-        // Convert to E1002 color and draw first pixel
-        uint16_t color1 = rgb_to_e1002_color(r1, g1, b1);
-        int pixelX1 = g_png_offset_x + x;
-        if (pixelX1 >= 0 && pixelX1 < display.width() && 
-            pixelY >= 0 && pixelY < display.height()) {
-            display.drawPixel(pixelX1, pixelY, color1);
-        }
-        
-        // Process second pixel if it exists
-        if (x + 1 < pDraw->iWidth) {
-            if (pDraw->iPixelType == PNG_PIXEL_TRUECOLOR) {
-                r2 = pixels[(x + 1) * 3];
-                g2 = pixels[(x + 1) * 3 + 1];
-                b2 = pixels[(x + 1) * 3 + 2];
-            } else if (pDraw->iPixelType == PNG_PIXEL_TRUECOLOR_ALPHA) {
-                r2 = pixels[(x + 1) * 4];
-                g2 = pixels[(x + 1) * 4 + 1];
-                b2 = pixels[(x + 1) * 4 + 2];
-            } else if (pDraw->iPixelType == PNG_PIXEL_INDEXED) {
-                int paletteIndex = pixels[x + 1];
-                r2 = pDraw->pPalette[paletteIndex * 3];
-                g2 = pDraw->pPalette[paletteIndex * 3 + 1];
-                b2 = pDraw->pPalette[paletteIndex * 3 + 2];
-            } else {
-                r2 = g2 = b2 = pixels[x + 1];
-            }
-            
-            // Convert to E1002 color and draw second pixel
-            uint16_t color2 = rgb_to_e1002_color(r2, g2, b2);
-            int pixelX2 = g_png_offset_x + x + 1;
-            if (pixelX2 >= 0 && pixelX2 < display.width() && 
-                pixelY >= 0 && pixelY < display.height()) {
-                display.drawPixel(pixelX2, pixelY, color2);
-            }
-        }
-    }
-    
-    return 1;
-}
-
-/**
- * @brief PNG draw callback for decoding to buffer (for GxEPD2 drawBitmap)
- * @param pDraw PNG draw context
- * @return 1 on success, 0 on failure
- */
-int png_draw_to_buffer(PNGDRAW *pDraw) {
-    if (!g_png_rendering || !g_image_buffer) return 1;
-    
-    // Convert PNG pixels to E1002 colors and store in buffer
-    uint8_t *pixels = (uint8_t *)pDraw->pPixels;
-    int y = pDraw->y;
-    
-    // Debug: Log every 100th line to avoid spam
-    if (y % 100 == 0) {
-        Log_info("E1002: Buffer decoding PNG line %d, width=%d", y, pDraw->iWidth);
-    }
     
     // Process each pixel in the line
     for (int x = 0; x < pDraw->iWidth; x++) {
@@ -1416,10 +1150,57 @@ int png_draw_to_buffer(PNGDRAW *pDraw) {
             r = g = b = pixels[x];
         }
         
-        // Convert to E1002 color and store in buffer
+        // Convert to E1002 color and draw pixel
+        uint16_t color = rgb_to_e1002_color(r, g, b);
+        int pixelX = g_png_offset_x + x;
+        
+        if (pixelX >= 0 && pixelX < display.width() && 
+            pixelY >= 0 && pixelY < display.height()) {
+            display.drawPixel(pixelX, pixelY, color);
+        }
+    }
+    
+    return 1;
+}
+
+/**
+ * @brief PNG draw callback for decoding to framebuffer (for GxEPD2)
+ * @param pDraw PNG draw context
+ * @return 1 on success, 0 on failure
+ */
+int png_draw_to_buffer(PNGDRAW *pDraw) {
+    if (!g_png_rendering || !g_image_buffer) return 1;
+    
+    // Convert PNG pixels to E1002 colors and store in framebuffer
+    uint8_t *pixels = (uint8_t *)pDraw->pPixels;
+    int y = pDraw->y;
+    
+    // Process each pixel in the line
+    for (int x = 0; x < pDraw->iWidth; x++) {
+        uint8_t r, g, b;
+        
+        // Extract RGB values based on pixel type
+        if (pDraw->iPixelType == PNG_PIXEL_TRUECOLOR) {
+            r = pixels[x * 3];
+            g = pixels[x * 3 + 1];
+            b = pixels[x * 3 + 2];
+        } else if (pDraw->iPixelType == PNG_PIXEL_TRUECOLOR_ALPHA) {
+            r = pixels[x * 4];
+            g = pixels[x * 4 + 1];
+            b = pixels[x * 4 + 2];
+        } else if (pDraw->iPixelType == PNG_PIXEL_INDEXED) {
+            int paletteIndex = pixels[x];
+            r = pDraw->pPalette[paletteIndex * 3];
+            g = pDraw->pPalette[paletteIndex * 3 + 1];
+            b = pDraw->pPalette[paletteIndex * 3 + 2];
+        } else {
+            r = g = b = pixels[x];
+        }
+        
+        // Convert to E1002 color and store in framebuffer
         uint16_t color = rgb_to_e1002_color(r, g, b);
         
-        // Store in buffer (row-major order) as uint16_t
+        // Store in framebuffer (row-major order) as uint16_t
         if (y < g_buffer_height && x < g_buffer_width) {
             g_image_buffer[y * g_buffer_width + x] = color;
         }
