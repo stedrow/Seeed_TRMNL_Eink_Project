@@ -5,25 +5,351 @@
 #include <Preferences.h>
 #include <preferences_persistence.h>
 #include "DEV_Config.h"
+#include <vector>
+#include "Group5.h"
+
+#if defined(BOARD_SEEED_RETERMINAL_E1002)
+// GxEPD2 library for E1002 7-color display
+#include <GxEPD2_7C.h>
+#include <Fonts/FreeMonoBold9pt7b.h>
+
+// E1002 display: 7.3" ACeP (7-color) e-Paper
+// Display dimensions: 800x480
+// Use GxEPD2_7C wrapper for full paged drawing support
+GxEPD2_7C<GxEPD2_730c_GDEP073E01, GxEPD2_730c_GDEP073E01::HEIGHT> display(GxEPD2_730c_GDEP073E01(EPD_CS_PIN, EPD_DC_PIN, EPD_RST_PIN, EPD_BUSY_PIN));
+
+// Counts the number of partial updates to know when to do a full update
+RTC_DATA_ATTR int iUpdateCount = 0;
+
+// E1002-specific configuration constants
+#define E1002_COLOR_CACHE_SIZE 512
+#define E1002_MAX_COLORS 7
+#define E1002_COLOR_MAP_SIZE 7
+
+// Define constants for compatibility
+#define REFRESH_FULL 0
+#define REFRESH_PARTIAL 1
+#define REFRESH_FAST 2
+
+// Panel type constants for compatibility
+#define ONE_BIT_PANEL 0
+#define TWO_BIT_PANEL 1
+
+// Plane constants for compatibility
+#define PLANE_0 0
+#define PLANE_1 1
+
+// Sleep mode constants
+#define DEEP_SLEEP 1
+
+// BB_RECT structure definition (must be before E1002DisplayWrapper)
+typedef struct {
+    int16_t x, y;
+    uint16_t w, h;
+} BB_RECT;
+
+// Helper class to provide bbep-like interface for E1002
+class E1002DisplayWrapper {
+private:
+    static uint8_t* buffer;
+    static bool bufferAllocated;
+    static const void* currentFont;
+    static uint16_t textColor;
+    static uint16_t bgColor;
+    static int16_t cursorX;
+    static int16_t cursorY;
+    static bool inPagedMode;
+
+    // PNG image data storage
+    static std::vector<uint8_t> imageData;
+    static int imageWidth;
+    static int imageHeight;
+    static int currentImageLine;
+    static bool hasImageData;
+
+    // Structure to store drawing commands for paged rendering
+    struct DrawCommand {
+        enum Type { TEXT, RECT, LINE } type;
+        String text;
+        int16_t x, y;
+        uint16_t color;
+    };
+    static std::vector<DrawCommand> drawCommands;
+
+public:
+    static uint8_t* getCache() {
+        static uint8_t cache[E1002_COLOR_CACHE_SIZE];
+        return cache;
+    }
+
+    static void writeData(uint8_t* data, size_t len) {
+        // Capture PNG image data line by line
+        // This is called during PNG decoding (from png_draw_into_4bpp)
+        if (data && len > 0) {
+            // Append the line data to our image buffer
+            size_t currentSize = imageData.size();
+            imageData.resize(currentSize + len);
+            memcpy(&imageData[currentSize], data, len);
+            currentImageLine++;
+            hasImageData = true;
+        }
+    }
+
+    static void writeCmd(uint8_t cmd) {
+        // Low-level commands for direct display control
+        // For E1002, detect when PNG decoding starts to prepare image capture
+        if (cmd == 0x10) { // DATA_START_TRANSMISSION_1
+            // Reset image data capture for new image
+            imageData.clear();
+            imageData.reserve(display.width() * display.height() / 2); // 4bpp = 0.5 bytes per pixel
+            currentImageLine = 0;
+            imageWidth = display.width();
+            imageHeight = display.height();
+            hasImageData = false;
+        }
+    }
+
+    static uint16_t width() { return display.width(); }
+    static uint16_t height() { return display.height(); }
+
+    static void setFont(const void* font) {
+        currentFont = font;
+        // For E1002, we'll use FreeMonoBold9pt7b from GxEPD2
+        // bb_epaper fonts are ignored
+        if (inPagedMode) {
+            display.setFont(&FreeMonoBold9pt7b);
+        }
+    }
+
+    static void setTextColor(uint16_t fg, uint16_t bg) {
+        textColor = fg;
+        bgColor = bg;
+        if (inPagedMode) {
+            display.setTextColor(fg);
+        }
+    }
+
+    static void setCursor(int16_t x, int16_t y) {
+        if (y == -1) {
+            // bb_epaper uses -1 to mean "next line"
+            cursorY += 20; // Approximate line height
+        } else {
+            cursorY = y;
+        }
+        if (x != -1) {
+            cursorX = x;
+        }
+        if (inPagedMode) {
+            display.setCursor(cursorX, cursorY);
+        }
+    }
+
+    static void print(const char* str) {
+        if (inPagedMode) {
+            display.print(str);
+        } else {
+            // Store for later rendering
+            DrawCommand cmd;
+            cmd.type = DrawCommand::TEXT;
+            cmd.text = String(str);
+            cmd.x = cursorX;
+            cmd.y = cursorY;
+            cmd.color = textColor;
+            drawCommands.push_back(cmd);
+        }
+    }
+
+    static void print(String str) {
+        print(str.c_str());
+    }
+
+    static void println(const char* str) {
+        print(str);
+        cursorY += 20; // Move to next line
+    }
+
+    static void println(String str) {
+        println(str.c_str());
+    }
+
+    static void getStringBox(const char* str, BB_RECT* rect) {
+        // For bb_epaper fonts, use approximate measurements
+        // For GxEPD2, we'd need to measure with actual font
+        rect->x = cursorX;
+        rect->y = cursorY;
+        // Approximate: nicoclean_8 is about 6 pixels wide, 8 pixels tall
+        rect->w = strlen(str) * 6;
+        rect->h = 8;
+    }
+
+    static void getStringBox(String str, BB_RECT* rect) {
+        getStringBox(str.c_str(), rect);
+    }
+
+    static void allocBuffer(bool twoPlanes) {
+        // GxEPD2 manages its own buffer internally
+        bufferAllocated = true;
+    }
+
+    static void freeBuffer() {
+        bufferAllocated = false;
+    }
+
+    static uint8_t* getBuffer() {
+        // For compatibility with code that expects direct buffer access
+        if (!buffer) {
+            size_t bufferSize = (display.width() / 8) * display.height();
+            buffer = (uint8_t*)malloc(bufferSize);
+            if (buffer) {
+                memset(buffer, 0xFF, bufferSize); // Initialize to white
+            }
+        }
+        return buffer;
+    }
+
+    static void setBuffer(uint8_t* buf) {
+        buffer = buf;
+    }
+
+    static void fillScreen(uint16_t color) {
+        if (inPagedMode) {
+            display.fillScreen(color);
+        }
+        // Note: When not in paged mode, just store the state for later
+    }
+
+    static void loadG5Image(const uint8_t* data, int x, int y, uint16_t fg, uint16_t bg) {
+        // Group5 compressed images - need to decompress and render
+        // TODO: Implement G5 decompression and rendering with GxEPD2
+        (void)data; (void)x; (void)y; (void)fg; (void)bg; // Suppress unused warnings
+    }
+
+    static int loadBMP(const uint8_t* data, int x, int y, uint16_t fg, uint16_t bg) {
+        // BMP loading for E1002 - needs implementation
+        // TODO: Implement BMP loading with GxEPD2
+        (void)data; (void)x; (void)y; (void)fg; (void)bg; // Suppress unused warnings
+        return 0;
+    }
+
+    static void writePlane(int plane) {
+        // E1002 doesn't use planes the same way as bb_epaper
+        // This is a no-op for GxEPD2
+        (void)plane; // Suppress unused warning
+    }
+
+    static void refresh(int mode, bool wait) {
+        // This is the key method - triggers actual display update
+        (void)mode; (void)wait; // Will use these when we add mode-specific handling
+
+        // Start paged drawing mode
+        display.setFullWindow();
+        display.firstPage();
+        inPagedMode = true;
+
+        do {
+            // Clear screen
+            display.fillScreen(GxEPD_WHITE);
+
+            // If we have PNG image data, render it first
+            if (hasImageData && !imageData.empty()) {
+                // Use GxEPD2's writeImage method to draw the 4bpp image
+                // The PNG data is already in 4bpp format from png_draw_into_4bpp()
+                display.writeImage(imageData.data(), 0, 0, imageWidth, imageHeight);
+            }
+
+            // Execute any buffered drawing commands (text overlays)
+            display.setFont(&FreeMonoBold9pt7b);
+            for (const auto& cmd : drawCommands) {
+                if (cmd.type == DrawCommand::TEXT) {
+                    display.setTextColor(cmd.color);
+                    display.setCursor(cmd.x, cmd.y);
+                    display.print(cmd.text);
+                }
+            }
+
+            // If we have a buffer with image data, draw it
+            if (buffer && bufferAllocated) {
+                // TODO: Render buffer content to display
+                // This would involve converting 1-bpp buffer to GxEPD2 format
+            }
+
+        } while (display.nextPage());
+
+        inPagedMode = false;
+
+        // Clear draw commands and image data after rendering
+        drawCommands.clear();
+        imageData.clear();
+        hasImageData = false;
+    }
+
+    static void setAddrWindow(int x, int y, int w, int h) {
+        // Memory window setup - not needed for GxEPD2 paged mode
+        (void)x; (void)y; (void)w; (void)h; // Suppress unused warnings
+    }
+
+    static void startWrite(int plane) {
+        // Start writing to a plane - not used in GxEPD2
+        (void)plane; // Suppress unused warning
+    }
+
+    static void setPanelType(int type) {
+        // E1002 is always 7-color, no panel type switching
+        (void)type; // Suppress unused warning
+    }
+
+    static void fullUpdate() {
+        // Same as refresh with full mode
+        refresh(REFRESH_FULL, true);
+    }
+};
+
+// Initialize static members
+uint8_t* E1002DisplayWrapper::buffer = nullptr;
+bool E1002DisplayWrapper::bufferAllocated = false;
+const void* E1002DisplayWrapper::currentFont = nullptr;
+uint16_t E1002DisplayWrapper::textColor = GxEPD_BLACK;
+uint16_t E1002DisplayWrapper::bgColor = GxEPD_WHITE;
+int16_t E1002DisplayWrapper::cursorX = 0;
+int16_t E1002DisplayWrapper::cursorY = 0;
+bool E1002DisplayWrapper::inPagedMode = false;
+std::vector<E1002DisplayWrapper::DrawCommand> E1002DisplayWrapper::drawCommands;
+
+// PNG image data storage static members
+std::vector<uint8_t> E1002DisplayWrapper::imageData;
+int E1002DisplayWrapper::imageWidth = 0;
+int E1002DisplayWrapper::imageHeight = 0;
+int E1002DisplayWrapper::currentImageLine = 0;
+bool E1002DisplayWrapper::hasImageData = false;
+
+// Create a bbep-like object for E1002 code compatibility
+static E1002DisplayWrapper bbep;
+
+// Color constants for compatibility
+#define BBEP_BLACK GxEPD_BLACK
+#define BBEP_WHITE GxEPD_WHITE
+
+// Font compatibility for E1002
+// Since E1002 uses Adafruit GFX fonts, we need a placeholder for bb_epaper font references
+#define nicoclean_8 nullptr  // Will be replaced with GxEPD2 font in actual rendering
+
+#else
+// Original bb_epaper implementation for non-E1002 boards
 #define BB_EPAPER
 #ifdef BB_EPAPER
 #include "bb_epaper.h"
-//#define ONE_BIT_PANEL EP426_800x480
-//#define TWO_BIT_PANEL EP426_800x480_4GRAY
-#if defined(BOARD_SEEED_RETERMINAL_E1002)
-#define ONE_BIT_PANEL EP73_SPECTRA_800x480
-#define TWO_BIT_PANEL EP73_SPECTRA_800x480
-#else
 #define ONE_BIT_PANEL EP75_800x480
 #define TWO_BIT_PANEL EP75_800x480_4GRAY_OLD
-#endif
 BBEPAPER bbep(ONE_BIT_PANEL);
-// Counts the number of partial updates to know when to do a full update
 RTC_DATA_ATTR int iUpdateCount = 0;
 #else
 #include "FastEPD.h"
 FASTEPD bbep;
 #endif
+#include "../lib/bb_epaper/Fonts/Roboto_20.h"
+#include "../lib/bb_epaper/Fonts/nicoclean_8.h"
+#endif
+
 #include "Group5.h"
 #include <config.h>
 #include "wifi_connect_qr.h"
@@ -32,18 +358,10 @@ FASTEPD bbep;
 #include <api-client/display.h>
 #include <trmnl_log.h>
 #include "png_flip.h"
-#include "../lib/bb_epaper/Fonts/Roboto_20.h"
-#include "../lib/bb_epaper/Fonts/nicoclean_8.h"
+
 extern char filename[];
 extern Preferences preferences;
 extern ApiDisplayResult apiDisplayResult;
-
-// E1002-specific configuration constants
-#if defined(BOARD_SEEED_RETERMINAL_E1002)
-#define E1002_COLOR_CACHE_SIZE 512
-#define E1002_MAX_COLORS 7
-#define E1002_COLOR_MAP_SIZE 7
-#endif
 
 /**
  * @brief Function to init the display
@@ -53,16 +371,26 @@ extern ApiDisplayResult apiDisplayResult;
 void display_init(void)
 {
     Log_info("dev module start");
-#ifdef BB_EPAPER
-    bbep.initIO(EPD_DC_PIN, EPD_RST_PIN, EPD_BUSY_PIN, EPD_CS_PIN, EPD_MOSI_PIN, EPD_SCK_PIN, 8000000);
-#else
-    bbep.initPanel(BB_PANEL_EPDIY_V7);
-    bbep.setPanelSize(1448, 1072);
-#endif
-
 #if defined(BOARD_SEEED_RETERMINAL_E1002)
+    // Initialize GxEPD2 for E1002
+    // Configure SPI pins
+    SPI.begin(EPD_SCK_PIN, -1, EPD_MOSI_PIN, EPD_CS_PIN);
+
+    // Initialize the display
+    display.init(115200, true, 2, false); // 115200 baud, initial refresh, reset duration 2ms, no pulldown
+
+    Log_info("E1002: GxEPD2 initialized - 800x480 7-color display");
+
     // Test E1002 color capabilities on initialization
     test_e1002_color_mapping();
+#else
+    // Original bb_epaper initialization for non-E1002 boards
+    #ifdef BB_EPAPER
+    bbep.initIO(EPD_DC_PIN, EPD_RST_PIN, EPD_BUSY_PIN, EPD_CS_PIN, EPD_MOSI_PIN, EPD_SCK_PIN, 8000000);
+    #else
+    bbep.initPanel(BB_PANEL_EPDIY_V7);
+    bbep.setPanelSize(1448, 1072);
+    #endif
 #endif
 
     Log_info("dev module end");
@@ -72,9 +400,22 @@ void display_show_battery(float vBatt)
 {
 char szTemp[32];
 
+#if defined(BOARD_SEEED_RETERMINAL_E1002)
+    display.setFullWindow();
+    display.firstPage();
+    do {
+        display.fillScreen(GxEPD_WHITE);
+        display.setFont(&FreeMonoBold9pt7b);
+        display.setTextColor(GxEPD_BLACK);
+        display.setCursor(0, 100);
+        sprintf(szTemp, "VBatt = %f", vBatt);
+        display.print(szTemp);
+    } while (display.nextPage());
+    display.hibernate();
+#else
     bbep.allocBuffer(false);
-    bbep.fillScreen(BBEP_WHITE); // draw the image centered on a white background
-    bbep.setFont(nicoclean_8); //Roboto_20);
+    bbep.fillScreen(BBEP_WHITE);
+    bbep.setFont(nicoclean_8);
     bbep.setTextColor(BBEP_BLACK, BBEP_WHITE);
     bbep.setCursor(0, 100);
     sprintf(szTemp, "VBatt = %f", vBatt);
@@ -82,6 +423,7 @@ char szTemp[32];
     bbep.writePlane();
     bbep.refresh(REFRESH_FULL, true);
     bbep.sleep(DEEP_SLEEP);
+#endif
     while (1) {
         vTaskDelay(1);
     }
@@ -106,18 +448,25 @@ void display_sleep(uint32_t u32Millis)
 void display_reset(void)
 {
     Log_info("e-Paper Clear start");
+#if defined(BOARD_SEEED_RETERMINAL_E1002)
+    display.setFullWindow();
+    display.firstPage();
+    do {
+        display.fillScreen(GxEPD_WHITE);
+    } while (display.nextPage());
+#else
     bbep.fillScreen(BBEP_WHITE);
-#ifdef BB_EPAPER
+    #ifdef BB_EPAPER
     if (!apiDisplayResult.response.maximum_compatibility) {
         bbep.refresh(REFRESH_FAST, true);
     } else {
         bbep.refresh(REFRESH_FULL, true); // incompatible panel
     }
-#else
+    #else
     bbep.fullUpdate();
+    #endif
 #endif
     Log_info("e-Paper Clear end");
-    // DEV_Delay_ms(500);
 }
 
 /**
@@ -126,7 +475,11 @@ void display_reset(void)
  */
 uint16_t display_height()
 {
+#if defined(BOARD_SEEED_RETERMINAL_E1002)
+    return display.height();
+#else
     return bbep.height();
+#endif
 }
 
 /**
@@ -135,7 +488,11 @@ uint16_t display_height()
  */
 uint16_t display_width()
 {
+#if defined(BOARD_SEEED_RETERMINAL_E1002)
+    return display.width();
+#else
     return bbep.width();
+#endif
 }
 
 /**
@@ -820,22 +1177,23 @@ static void draw_virtual_bmp_from_png(const uint8_t *image_buffer)
 
 /**
  * @brief E1002-specific test function to validate color mapping
- * @note This function tests the 7-color capabilities of the E1002 display
+ * @note This function tests the 7-color capabilities of the E1002 display using GxEPD2
  */
 #if defined(BOARD_SEEED_RETERMINAL_E1002)
 void test_e1002_color_mapping() {
-    Log_info("E1002: Testing 7-color display capabilities");
-    
-    // Test color mapping array
-    uint8_t colorMap[E1002_COLOR_MAP_SIZE] = {0x0, 0x1, 0x2, 0x3, 0x4, 0x5, 0x6};
-    const char* colorNames[] = {"black", "white", "yellow", "red", "blue", "green", "orange"};
-    
-    Log_info("E1002: Available colors:");
-    for (int i = 0; i < E1002_COLOR_MAP_SIZE; i++) {
-        Log_info("  Color %d: %s (0x%02X)", i, colorNames[i], colorMap[i]);
+    Log_info("E1002: Testing GxEPD2 7-color display capabilities");
+
+    // GxEPD2 color constants for E1002 7-color display
+    const char* colorNames[] = {"Black", "White", "Red", "Yellow", "Blue", "Green"};
+    const uint16_t colors[] = {GxEPD_BLACK, GxEPD_WHITE, GxEPD_RED, GxEPD_YELLOW, GxEPD_BLUE, GxEPD_GREEN};
+
+    Log_info("E1002: Available GxEPD2 colors:");
+    for (int i = 0; i < 6; i++) {
+        Log_info("  Color %d: %s (0x%04X)", i, colorNames[i], colors[i]);
     }
-    
-    Log_info("E1002: Color mapping test completed");
+
+    Log_info("E1002: GxEPD2 color mapping test completed");
+    Log_info("E1002: Display size: %dx%d", display.width(), display.height());
 }
 #endif
 
@@ -1315,10 +1673,14 @@ void display_show_msg(uint8_t *image_buffer, MSG message_type, String friendly_i
 void display_sleep(void)
 {
     Log_info("Goto Sleep...");
-#ifdef BB_EPAPER
-    bbep.sleep(DEEP_SLEEP);
+#if defined(BOARD_SEEED_RETERMINAL_E1002)
+    display.hibernate();
 #else
+    #ifdef BB_EPAPER
+    bbep.sleep(DEEP_SLEEP);
+    #else
     bbep.einkPower(0);
     bbep.deInit();
+    #endif
 #endif
 }
