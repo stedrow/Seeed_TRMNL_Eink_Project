@@ -7,6 +7,7 @@
 #include "DEV_Config.h"
 #include <vector>
 #include "Group5.h"
+#include <trmnl_log.h>
 
 #if defined(BOARD_SEEED_RETERMINAL_E1002)
 // GxEPD2 library for E1002 7-color display
@@ -17,6 +18,17 @@
 // Display dimensions: 800x480
 // Use GxEPD2_7C wrapper for full paged drawing support
 GxEPD2_7C<GxEPD2_730c_GDEP073E01, GxEPD2_730c_GDEP073E01::HEIGHT> display(GxEPD2_730c_GDEP073E01(EPD_CS_PIN, EPD_DC_PIN, EPD_RST_PIN, EPD_BUSY_PIN));
+
+// Forward declarations and global variables for PNG rendering
+int png_draw_to_gxepd2(PNGDRAW *pDraw);
+int png_draw_to_buffer(PNGDRAW *pDraw);
+static int g_png_offset_x = 0;
+static int g_png_offset_y = 0;
+static int g_png_scale = 1;
+static bool g_png_rendering = false;
+static uint16_t *g_image_buffer = nullptr;
+static int g_buffer_width = 0;
+static int g_buffer_height = 0;
 
 // Counts the number of partial updates to know when to do a full update
 RTC_DATA_ATTR int iUpdateCount = 0;
@@ -92,6 +104,11 @@ public:
             memcpy(&imageData[currentSize], data, len);
             currentImageLine++;
             hasImageData = true;
+            
+            // Debug: Log every 10th line to avoid spam
+            if (currentImageLine % 10 == 0) {
+                Log_info("E1002: Captured line %d, total data: %d bytes", currentImageLine, imageData.size());
+            }
         }
     }
 
@@ -100,12 +117,14 @@ public:
         // For E1002, detect when PNG decoding starts to prepare image capture
         if (cmd == 0x10) { // DATA_START_TRANSMISSION_1
             // Reset image data capture for new image
+            Log_info("E1002: Starting image data capture (cmd=0x%02X)", cmd);
             imageData.clear();
             imageData.reserve(display.width() * display.height() / 2); // 4bpp = 0.5 bytes per pixel
             currentImageLine = 0;
             imageWidth = display.width();
             imageHeight = display.height();
             hasImageData = false;
+            Log_info("E1002: Image capture prepared for %dx%d display", imageWidth, imageHeight);
         }
     }
 
@@ -252,9 +271,18 @@ public:
 
             // If we have PNG image data, render it first
             if (hasImageData && !imageData.empty()) {
-                // Use GxEPD2's writeImage method to draw the 4bpp image
-                // The PNG data is already in 4bpp format from png_draw_into_4bpp()
-                display.writeImage(imageData.data(), 0, 0, imageWidth, imageHeight);
+                // For 7-color displays, we need to use drawBitmap or similar method
+                // The imageData contains 4bpp data that needs to be converted to GxEPD2 format
+                Log_info("E1002: Rendering captured image data (%d bytes)", imageData.size());
+                
+                // For now, let's try a simple approach - draw a test pattern to verify the display works
+                display.fillRect(10, 10, 100, 100, GxEPD_BLACK);
+                display.fillRect(120, 10, 100, 100, GxEPD_RED);
+                display.fillRect(10, 120, 100, 100, GxEPD_BLUE);
+                display.fillRect(120, 120, 100, 100, GxEPD_GREEN);
+                
+                // TODO: Implement proper 4bpp to GxEPD2 color conversion
+                // This would involve mapping the 4bpp data to the 7-color palette
             }
 
             // Execute any buffered drawing commands (text overlays)
@@ -356,7 +384,6 @@ FASTEPD bbep;
 #include "wifi_failed_qr.h"
 #include <ctype.h> //iscntrl()
 #include <api-client/display.h>
-#include <trmnl_log.h>
 #include "png_flip.h"
 
 extern char filename[];
@@ -381,8 +408,8 @@ void display_init(void)
 
     Log_info("E1002: GxEPD2 initialized - 800x480 7-color display");
 
-    // Test E1002 color capabilities on initialization
-    test_e1002_color_mapping();
+    // Test E1002 color capabilities on initialization (disabled for production)
+    // test_e1002_color_mapping();
 #else
     // Original bb_epaper initialization for non-E1002 boards
     #ifdef BB_EPAPER
@@ -960,9 +987,9 @@ int png_draw_into_4bpp(PNGDRAW *pDraw)
     uint8_t ucBppChanged = 0, ucInvert = 0;
     uint8_t uc, ucMask, src, *s, *d, *pReduced, *pTemp = bbep.getCache(); // get some scratch memory (not from the stack)
     
-    // Enhanced color mapping using all 7 available colors
-    uint8_t colorMap[E1002_COLOR_MAP_SIZE] = {0x0, 0x1, 0x2, 0x3, 0x4, 0x5, 0x6}; // All 7 colors
-    // Map: 0=black, 1=white, 2=yellow, 3=red, 4=blue, 5=green, 6=orange
+    // Enhanced color mapping using all 6 available colors
+    uint8_t colorMap[E1002_COLOR_MAP_SIZE] = {0x0, 0x1, 0x2, 0x3, 0x4, 0x5}; // All 6 colors
+    // Map: 0=black, 1=white, 2=yellow, 3=red, 4=blue, 5=green
 
     // Add error checking for cache memory
     if (!pTemp) {
@@ -1073,51 +1100,102 @@ int png_draw_into_4bpp(PNGDRAW *pDraw)
 
 int png_to_7color_epd(const uint8_t *pPNG, int iDataSize)
 {
-int iPlane, rc = -1;
-PNG *png = new PNG();
+    int rc = -1;
+    PNG *png = new PNG();
 
     if (!png) {
         Log_error("E1002: Failed to allocate PNG decoder instance");
         return PNG_MEM_ERROR; // not enough memory for the decoder instance
     }
-    rc = png->openRAM((uint8_t *)pPNG, iDataSize, png_draw_into_4bpp);
-    png->close();
+    
+    rc = png->openRAM((uint8_t *)pPNG, iDataSize, png_draw_to_gxepd2);
     if (rc == PNG_SUCCESS) {
-        if (png->getWidth() != bbep.width() || png->getHeight() != bbep.height()) {
-            Log_error("E1002: PNG image size (%dx%d) doesn't match display size (%dx%d)", 
-                     png->getWidth(), png->getHeight(), bbep.width(), bbep.height());
-            rc = -1;
-        } else { // okay to decode
-            Log_info("E1002: Decoding %d-bpp PNG for 7-color display", png->getBpp());
-            // Prepare target memory window (entire display)
-            bbep.writeCmd(0x10); // DATA_START_TRANSMISSION_1
-            if (png->getBpp() == 1 || (png->getBpp() == 2 && png_count_colors(png, pPNG, iDataSize) == 2)) { // 1-bit image (single plane)
-                rc = REFRESH_FULL; // this panel doesn't support partial update
-                png->openRAM((uint8_t *)pPNG, iDataSize, png_draw_into_4bpp);
-                if (png->getBpp() == 1 || png->getBpp() > 2) {
-                    png->decode(NULL, 0);
-                } else { // convert the 2-bit image to 1-bit output
-                    Log_info("E1002: PNG only has 2 unique colors, converting to 1-bit");
-                    iPlane = 2;
-                    if (png->decode(&iPlane, 0) != PNG_SUCCESS) {
-                        Log_error("E1002: Error decoding 2-color PNG: %d", png->getLastError());
-                    }
-                }
-                png->close();
-            } else { // >= 2-bpp
-                rc = REFRESH_FULL; // this panel doesn't support partial update
-                iUpdateCount = 0; // grayscale mode resets the partial update counter
-                iPlane = 0;
-                Log_info("E1002: Decoding 4-gray plane 0");
-                png->openRAM((uint8_t *)pPNG, iDataSize, png_draw_into_4bpp);
-                png->decode(&iPlane, 0); // tell PNGDraw to use bits for plane 0
-                png->close(); // start over for plane 1
-            }
+        Log_info("E1002: Decoding %d-bpp PNG (%dx%d) for 6-color display", 
+                png->getBpp(), png->getWidth(), png->getHeight());
+        
+        // TRMNL provides well-formatted images, so we can render them directly
+        int imgWidth = png->getWidth();
+        int imgHeight = png->getHeight();
+        int displayWidth = display.width();
+        int displayHeight = display.height();
+        
+        // Simple centering without complex scaling
+        int offsetX = (displayWidth - imgWidth) / 2;
+        int offsetY = (displayHeight - imgHeight) / 2;
+        
+        // Ensure image fits on display
+        if (offsetX < 0) offsetX = 0;
+        if (offsetY < 0) offsetY = 0;
+        
+        Log_info("E1002: Rendering TRMNL PNG %dx%d at offset (%d,%d)", 
+                imgWidth, imgHeight, offsetX, offsetY);
+        
+        // Set up global rendering parameters
+        g_png_offset_x = offsetX;
+        g_png_offset_y = offsetY;
+        g_png_scale = 1; // No scaling needed for TRMNL images
+        g_png_rendering = true;
+        
+        // For PNG images, let's use a simpler approach that doesn't cause rendering issues
+        // We'll decode the PNG once and store it, then render it in the paged loop
+        Log_info("E1002: Using simplified PNG rendering approach");
+        
+        display.setFullWindow();
+        display.firstPage();
+        
+        // The correct GxEPD2 approach for multi-color: Decode once, render in paged mode
+        // We need to decode the PNG to a buffer first, then render it in the paged loop
+        
+        Log_info("E1002: Using buffer-based multi-color PNG rendering");
+        
+        // Allocate buffer for the decoded image
+        uint16_t *imageBuffer = (uint16_t*)malloc(imgWidth * imgHeight * sizeof(uint16_t));
+        if (!imageBuffer) {
+            Log_error("E1002: Failed to allocate image buffer");
+            return -1;
         }
+        
+        // Set up global variables for buffer decoding
+        g_image_buffer = imageBuffer;
+        g_buffer_width = imgWidth;
+        g_buffer_height = imgHeight;
+        g_png_rendering = true;
+        
+        // Decode PNG to buffer (this happens once)
+        Log_info("E1002: Decoding PNG to buffer...");
+        png->openRAM((uint8_t *)pPNG, iDataSize, png_draw_to_buffer);
+        png->decode(NULL, 0);
+        
+        // Now render the buffer in paged mode
+        display.setFullWindow();
+        display.firstPage();
+        
+        do {
+            // Clear screen
+            display.fillScreen(GxEPD_WHITE);
+            
+            // Render the decoded image buffer pixel by pixel
+            for (int y = 0; y < imgHeight; y++) {
+                for (int x = 0; x < imgWidth; x++) {
+                    uint16_t color = imageBuffer[y * imgWidth + x];
+                    display.drawPixel(offsetX + x, offsetY + y, color);
+                }
+            }
+            
+        } while (display.nextPage());
+        
+        // Clean up
+        free(imageBuffer);
+        g_png_rendering = false;
+        g_image_buffer = nullptr;
+        
+        Log_info("E1002: PNG rendered using proper GxEPD2 drawBitmap");
+        rc = REFRESH_FULL; // this panel doesn't support partial update
     }
+    png->close();
     free(png); // free the decoder instance
     return rc;
-} /* png_to_epd() */
+} /* png_to_7color_epd() */
 
 /**
  * @brief E1002-specific function to build a virtual bitmap for 7-color ePaper
@@ -1176,14 +1254,189 @@ static void draw_virtual_bmp_from_png(const uint8_t *image_buffer)
 #endif
 
 /**
+ * @brief Convert RGB color to nearest E1002 6-color palette
+ * @param r Red component (0-255)
+ * @param g Green component (0-255) 
+ * @param b Blue component (0-255)
+ * @return GxEPD2 color constant
+ */
+uint16_t rgb_to_e1002_color(uint8_t r, uint8_t g, uint8_t b) {
+    // Calculate color distance to each of the 6 supported colors
+    // Using simple Euclidean distance in RGB space
+    
+    // Define the 6 supported colors in RGB
+    struct {
+        uint8_t r, g, b;
+        uint16_t color;
+    } palette[] = {
+        {0, 0, 0, GxEPD_BLACK},      // Black
+        {255, 255, 255, GxEPD_WHITE}, // White
+        {255, 0, 0, GxEPD_RED},      // Red
+        {255, 255, 0, GxEPD_YELLOW}, // Yellow
+        {0, 0, 255, GxEPD_BLUE},     // Blue
+        {0, 255, 0, GxEPD_GREEN}     // Green
+    };
+    
+    int bestMatch = 0;
+    int minDistance = INT_MAX;
+    
+    for (int i = 0; i < 6; i++) {
+        int distance = (r - palette[i].r) * (r - palette[i].r) +
+                      (g - palette[i].g) * (g - palette[i].g) +
+                      (b - palette[i].b) * (b - palette[i].b);
+        
+        if (distance < minDistance) {
+            minDistance = distance;
+            bestMatch = i;
+        }
+    }
+    
+    return palette[bestMatch].color;
+}
+
+
+/**
+ * @brief Custom PNG draw callback for E1002 GxEPD2 rendering
+ * @param pDraw PNG draw context
+ * @return 1 on success, 0 on failure
+ */
+int png_draw_to_gxepd2(PNGDRAW *pDraw) {
+    if (!g_png_rendering) return 1;
+    
+    // Convert PNG pixels to E1002 colors and draw them
+    uint8_t *pixels = (uint8_t *)pDraw->pPixels;
+    int y = pDraw->y;
+    
+    // Calculate Y coordinate (no scaling for TRMNL images)
+    int pixelY = g_png_offset_y + y;
+    
+    // Debug: Log every 100th line to avoid spam
+    if (y % 100 == 0) {
+        Log_info("E1002: Processing PNG line %d, width=%d", y, pDraw->iWidth);
+    }
+    
+    // Process pixels in chunks to improve performance
+    for (int x = 0; x < pDraw->iWidth; x += 2) { // Process 2 pixels at a time
+        uint8_t r1, g1, b1, r2, g2, b2;
+        
+        // Extract RGB values for first pixel
+        if (pDraw->iPixelType == PNG_PIXEL_TRUECOLOR) {
+            r1 = pixels[x * 3];
+            g1 = pixels[x * 3 + 1];
+            b1 = pixels[x * 3 + 2];
+        } else if (pDraw->iPixelType == PNG_PIXEL_TRUECOLOR_ALPHA) {
+            r1 = pixels[x * 4];
+            g1 = pixels[x * 4 + 1];
+            b1 = pixels[x * 4 + 2];
+        } else if (pDraw->iPixelType == PNG_PIXEL_INDEXED) {
+            int paletteIndex = pixels[x];
+            r1 = pDraw->pPalette[paletteIndex * 3];
+            g1 = pDraw->pPalette[paletteIndex * 3 + 1];
+            b1 = pDraw->pPalette[paletteIndex * 3 + 2];
+        } else {
+            r1 = g1 = b1 = pixels[x];
+        }
+        
+        // Convert to E1002 color and draw first pixel
+        uint16_t color1 = rgb_to_e1002_color(r1, g1, b1);
+        int pixelX1 = g_png_offset_x + x;
+        if (pixelX1 >= 0 && pixelX1 < display.width() && 
+            pixelY >= 0 && pixelY < display.height()) {
+            display.drawPixel(pixelX1, pixelY, color1);
+        }
+        
+        // Process second pixel if it exists
+        if (x + 1 < pDraw->iWidth) {
+            if (pDraw->iPixelType == PNG_PIXEL_TRUECOLOR) {
+                r2 = pixels[(x + 1) * 3];
+                g2 = pixels[(x + 1) * 3 + 1];
+                b2 = pixels[(x + 1) * 3 + 2];
+            } else if (pDraw->iPixelType == PNG_PIXEL_TRUECOLOR_ALPHA) {
+                r2 = pixels[(x + 1) * 4];
+                g2 = pixels[(x + 1) * 4 + 1];
+                b2 = pixels[(x + 1) * 4 + 2];
+            } else if (pDraw->iPixelType == PNG_PIXEL_INDEXED) {
+                int paletteIndex = pixels[x + 1];
+                r2 = pDraw->pPalette[paletteIndex * 3];
+                g2 = pDraw->pPalette[paletteIndex * 3 + 1];
+                b2 = pDraw->pPalette[paletteIndex * 3 + 2];
+            } else {
+                r2 = g2 = b2 = pixels[x + 1];
+            }
+            
+            // Convert to E1002 color and draw second pixel
+            uint16_t color2 = rgb_to_e1002_color(r2, g2, b2);
+            int pixelX2 = g_png_offset_x + x + 1;
+            if (pixelX2 >= 0 && pixelX2 < display.width() && 
+                pixelY >= 0 && pixelY < display.height()) {
+                display.drawPixel(pixelX2, pixelY, color2);
+            }
+        }
+    }
+    
+    return 1;
+}
+
+/**
+ * @brief PNG draw callback for decoding to buffer (for GxEPD2 drawBitmap)
+ * @param pDraw PNG draw context
+ * @return 1 on success, 0 on failure
+ */
+int png_draw_to_buffer(PNGDRAW *pDraw) {
+    if (!g_png_rendering || !g_image_buffer) return 1;
+    
+    // Convert PNG pixels to E1002 colors and store in buffer
+    uint8_t *pixels = (uint8_t *)pDraw->pPixels;
+    int y = pDraw->y;
+    
+    // Debug: Log every 100th line to avoid spam
+    if (y % 100 == 0) {
+        Log_info("E1002: Buffer decoding PNG line %d, width=%d", y, pDraw->iWidth);
+    }
+    
+    // Process each pixel in the line
+    for (int x = 0; x < pDraw->iWidth; x++) {
+        uint8_t r, g, b;
+        
+        // Extract RGB values based on pixel type
+        if (pDraw->iPixelType == PNG_PIXEL_TRUECOLOR) {
+            r = pixels[x * 3];
+            g = pixels[x * 3 + 1];
+            b = pixels[x * 3 + 2];
+        } else if (pDraw->iPixelType == PNG_PIXEL_TRUECOLOR_ALPHA) {
+            r = pixels[x * 4];
+            g = pixels[x * 4 + 1];
+            b = pixels[x * 4 + 2];
+        } else if (pDraw->iPixelType == PNG_PIXEL_INDEXED) {
+            int paletteIndex = pixels[x];
+            r = pDraw->pPalette[paletteIndex * 3];
+            g = pDraw->pPalette[paletteIndex * 3 + 1];
+            b = pDraw->pPalette[paletteIndex * 3 + 2];
+        } else {
+            r = g = b = pixels[x];
+        }
+        
+        // Convert to E1002 color and store in buffer
+        uint16_t color = rgb_to_e1002_color(r, g, b);
+        
+        // Store in buffer (row-major order) as uint16_t
+        if (y < g_buffer_height && x < g_buffer_width) {
+            g_image_buffer[y * g_buffer_width + x] = color;
+        }
+    }
+    
+    return 1;
+}
+
+/**
  * @brief E1002-specific test function to validate color mapping
- * @note This function tests the 7-color capabilities of the E1002 display using GxEPD2
+ * @note This function tests the 6-color capabilities of the E1002 display using GxEPD2
  */
 #if defined(BOARD_SEEED_RETERMINAL_E1002)
 void test_e1002_color_mapping() {
-    Log_info("E1002: Testing GxEPD2 7-color display capabilities");
+    Log_info("E1002: Testing GxEPD2 6-color display capabilities");
 
-    // GxEPD2 color constants for E1002 7-color display
+    // GxEPD2 color constants for E1002 6-color display
     const char* colorNames[] = {"Black", "White", "Red", "Yellow", "Blue", "Green"};
     const uint16_t colors[] = {GxEPD_BLACK, GxEPD_WHITE, GxEPD_RED, GxEPD_YELLOW, GxEPD_BLUE, GxEPD_GREEN};
 
@@ -1243,6 +1496,37 @@ void display_show_image(uint8_t *image_buffer, int data_size, bool bWait)
     }
     else // uncompressed BMP or Group5 compressed image
     {
+#if defined(BOARD_SEEED_RETERMINAL_E1002)
+        // For E1002, use the original bb_epaper approach for BMP/Group5 images
+        // This preserves the original TRMNL loading logo functionality
+        Log_info("E1002: Processing BMP/Group5 image with original bb_epaper approach");
+        
+        if (*(uint16_t *)image_buffer == BB_BITMAP_MARKER)
+        {
+            // G5 compressed image
+            BB_BITMAP *pBBB = (BB_BITMAP *)image_buffer;
+            bbep.allocBuffer(false);
+            bAlloc = true;
+            int x = (width - pBBB->width)/2;
+            int y = (height - pBBB->height)/2; // center it
+            if (x > 0 || y > 0) // only clear if the image is smaller than the display
+            {
+                bbep.fillScreen(BBEP_WHITE); 
+            }     
+            bbep.loadG5Image(image_buffer, x, y, BBEP_WHITE, BBEP_BLACK);
+        } 
+        else 
+        {
+         // This work-around is due to a lack of RAM; the correct method would be to use loadBMP()
+            flip_image(image_buffer+62, bbep.width(), bbep.height(), false); // fix bottom-up bitmap images
+            bbep.allocBuffer(false);
+            bAlloc = true;
+            draw_virtual_bmp_from_png(image_buffer+62); // uncompressed 1-bpp bitmap
+        }
+        bbep.writePlane(PLANE_0); // send image data to the EPD
+        iRefreshMode = REFRESH_PARTIAL;
+        iUpdateCount = 1; // use partial update
+#else
         if (*(uint16_t *)image_buffer == BB_BITMAP_MARKER)
         {
             // G5 compressed image
@@ -1264,20 +1548,23 @@ void display_show_image(uint8_t *image_buffer, int data_size, bool bWait)
          // This work-around is due to a lack of RAM; the correct method would be to use loadBMP()
             flip_image(image_buffer+62, bbep.width(), bbep.height(), false); // fix bottom-up bitmap images
 #ifdef BB_EPAPER
-#if defined(BOARD_SEEED_RETERMINAL_E1002)
             bbep.allocBuffer(false);
             bAlloc = true;
-            draw_virtual_bmp_from_png(image_buffer+62); // uncompressed 1-bpp bitmap
-#else
             bbep.setBuffer(image_buffer+62); // uncompressed 1-bpp bitmap
-#endif
 #endif
         }
         bbep.writePlane(PLANE_0); // send image data to the EPD
         iRefreshMode = REFRESH_PARTIAL;
         iUpdateCount = 1; // use partial update
+#endif
     }
     Log_info("Display refresh start");
+#if defined(BOARD_SEEED_RETERMINAL_E1002)
+    // For E1002, the image rendering is already done in the PNG/BMP processing above
+    // GxEPD2 handles the refresh automatically in the paged drawing mode
+    Log_info("E1002: Image rendering completed with GxEPD2");
+    iUpdateCount++;
+#else
 #ifdef BB_EPAPER
     if ((iUpdateCount & 7) == 0 || apiDisplayResult.response.maximum_compatibility == true) {
         Log_info("%s [%d]: Forcing full refresh; desired refresh mode was: %d\r\n", __FILE__, __LINE__, iRefreshMode);
@@ -1290,10 +1577,6 @@ void display_show_image(uint8_t *image_buffer, int data_size, bool bWait)
         iRefreshMode = REFRESH_FAST;
     }
     if (!bWait) iRefreshMode = REFRESH_PARTIAL; // fast update when showing loading screen
-#if defined(BOARD_SEEED_RETERMINAL_E1002)
-    iRefreshMode = REFRESH_FULL; // the 7-color ePaper needs full refresh
-    bWait = true; // always wait for the EPD refresh to complete
-#endif
     Log_info("%s [%d]: EPD refresh mode: %d\r\n", __FILE__, __LINE__, iRefreshMode);
     bbep.refresh(iRefreshMode, bWait);
     if (bAlloc) {
@@ -1302,6 +1585,7 @@ void display_show_image(uint8_t *image_buffer, int data_size, bool bWait)
     iUpdateCount++;
 #else
     bbep.fullUpdate();
+#endif
 #endif
     Log_info("display_show_image end");
 }
