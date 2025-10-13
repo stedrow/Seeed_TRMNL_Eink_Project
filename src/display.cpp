@@ -38,13 +38,6 @@ extern char filename[];
 extern Preferences preferences;
 extern ApiDisplayResult apiDisplayResult;
 
-// E1002-specific configuration constants
-#if defined(BOARD_SEEED_RETERMINAL_E1002)
-#define E1002_COLOR_CACHE_SIZE 512
-#define E1002_MAX_COLORS 7
-#define E1002_COLOR_MAP_SIZE 7
-#endif
-
 /**
  * @brief Function to init the display
  * @param none
@@ -59,12 +52,6 @@ void display_init(void)
     bbep.initPanel(BB_PANEL_EPDIY_V7);
     bbep.setPanelSize(1448, 1072);
 #endif
-
-#if defined(BOARD_SEEED_RETERMINAL_E1002)
-    // Test E1002 color capabilities on initialization
-    test_e1002_color_mapping();
-#endif
-
     Log_info("dev module end");
 }
 
@@ -590,11 +577,7 @@ PNG *png = new PNG();
 } /* png_to_epd() */
 
 /**
- * @brief E1002-specific PNG processing for 7-color display
- * @param pDraw PNG draw context
- * @return 1 on success, 0 on failure
- * @note This function processes PNG data specifically for the E1002's
- *       7-color Spectra 6 e-ink display (black, white, yellow, red, blue, green, orange)
+ * The following functions are for E1002 only, temporary implementation for its 4bpp panel
  */
 #if defined(BOARD_SEEED_RETERMINAL_E1002)
 int png_draw_into_4bpp(PNGDRAW *pDraw)
@@ -602,18 +585,8 @@ int png_draw_into_4bpp(PNGDRAW *pDraw)
     int x;
     uint8_t ucBppChanged = 0, ucInvert = 0;
     uint8_t uc, ucMask, src, *s, *d, *pReduced, *pTemp = bbep.getCache(); // get some scratch memory (not from the stack)
-    
-    // Enhanced color mapping using all 7 available colors
-    uint8_t colorMap[E1002_COLOR_MAP_SIZE] = {0x0, 0x1, 0x2, 0x3, 0x4, 0x5, 0x6}; // All 7 colors
-    // Map: 0=black, 1=white, 2=yellow, 3=red, 4=blue, 5=green, 6=orange
-
-    // Add error checking for cache memory
-    if (!pTemp) {
-        Log_error("E1002: Failed to get cache memory for color processing");
-        return 0;
-    }
-
-    Log_verbose_serial("E1002: Processing %d-bpp PNG, pixel type: %d", pDraw->iBpp, pDraw->iPixelType);
+    uint8_t colorMap[4] = {0x01, 0x03, 0x05, 0x0}; // map 4 gray to 4 colors in 4bpp
+    //0 black, 1 white, 2 yellow, 3 red, 5 blue, 6 green
 
     if (pDraw->iPixelType == PNG_PIXEL_INDEXED || pDraw->iBpp > 2) {
         if (pDraw->iBpp == 1) { // 1-bit output, just see which color is brighter
@@ -625,11 +598,7 @@ int png_draw_into_4bpp(PNGDRAW *pDraw)
           }
         } else {
             // Reduce the source image to 1-bpp or 2-bpp
-            pReduced = (uint8_t *)calloc(E1002_COLOR_CACHE_SIZE, sizeof(uint8_t));
-            if (!pReduced) {
-                Log_error("E1002: Failed to allocate memory for color reduction");
-                return 0;
-            }
+            pReduced = (uint8_t *)calloc(512, sizeof(uint8_t));
             ReduceBpp(1, pDraw->iPixelType, pDraw->pPalette, pDraw->pPixels, pReduced, pDraw->iWidth, pDraw->iBpp);
             ReduceBpp(2, pDraw->iPixelType, pDraw->pPalette, pDraw->pPixels, pReduced, pDraw->iWidth, pDraw->iBpp);
             ucBppChanged = 1;
@@ -703,14 +672,8 @@ int png_draw_into_4bpp(PNGDRAW *pDraw)
         }
     }
 
-    // Safe memory cleanup
-    if (ucBppChanged && pReduced) {
-        free(pReduced);
-        pReduced = nullptr; // Prevent double-free
-    }
-    
+    if (ucBppChanged) free(pReduced);
     bbep.writeData(pTemp, (pDraw->iWidth + 1) / 2);
-    Log_verbose_serial("E1002: Color processing completed successfully");
     return 1;
 } /* png_draw() */
 
@@ -719,19 +682,15 @@ int png_to_7color_epd(const uint8_t *pPNG, int iDataSize)
 int iPlane, rc = -1;
 PNG *png = new PNG();
 
-    if (!png) {
-        Log_error("E1002: Failed to allocate PNG decoder instance");
-        return PNG_MEM_ERROR; // not enough memory for the decoder instance
-    }
+    if (!png) return PNG_MEM_ERROR; // not enough memory for the decoder instance
     rc = png->openRAM((uint8_t *)pPNG, iDataSize, png_draw_into_4bpp);
     png->close();
     if (rc == PNG_SUCCESS) {
         if (png->getWidth() != bbep.width() || png->getHeight() != bbep.height()) {
-            Log_error("E1002: PNG image size (%dx%d) doesn't match display size (%dx%d)", 
-                     png->getWidth(), png->getHeight(), bbep.width(), bbep.height());
+            Log_error("PNG image size doesn't match display size");
             rc = -1;
         } else { // okay to decode
-            Log_info("E1002: Decoding %d-bpp PNG for 7-color display", png->getBpp());
+            Log_info("%s [%d]: Decoding %d-bpp png (current)\r\n", __FILE__, __LINE__, png->getBpp());
             // Prepare target memory window (entire display)
             bbep.writeCmd(0x10); // DATA_START_TRANSMISSION_1
             if (png->getBpp() == 1 || (png->getBpp() == 2 && png_count_colors(png, pPNG, iDataSize) == 2)) { // 1-bit image (single plane)
@@ -740,10 +699,10 @@ PNG *png = new PNG();
                 if (png->getBpp() == 1 || png->getBpp() > 2) {
                     png->decode(NULL, 0);
                 } else { // convert the 2-bit image to 1-bit output
-                    Log_info("E1002: PNG only has 2 unique colors, converting to 1-bit");
+                    Log_info("%s [%d]: Current png only has 2 unique colors!\n", __FILE__, __LINE__);
                     iPlane = 2;
                     if (png->decode(&iPlane, 0) != PNG_SUCCESS) {
-                        Log_error("E1002: Error decoding 2-color PNG: %d", png->getLastError());
+                        Log_info("%s [%d]: Error decoding image = %d\n", __FILE__, __LINE__, png->getLastError());
                     }
                 }
                 png->close();
@@ -751,7 +710,7 @@ PNG *png = new PNG();
                 rc = REFRESH_FULL; // this panel doesn't support partial update
                 iUpdateCount = 0; // grayscale mode resets the partial update counter
                 iPlane = 0;
-                Log_info("E1002: Decoding 4-gray plane 0");
+                Log_info("%s [%d]: decoding 4-gray plane 0\r\n", __FILE__, __LINE__);
                 png->openRAM((uint8_t *)pPNG, iDataSize, png_draw_into_4bpp);
                 png->decode(&iPlane, 0); // tell PNGDraw to use bits for plane 0
                 png->close(); // start over for plane 1
@@ -763,19 +722,12 @@ PNG *png = new PNG();
 } /* png_to_epd() */
 
 /**
- * @brief E1002-specific function to build a virtual bitmap for 7-color ePaper
+ * @brief Function to build a virtual bitmap, be compatible with the colored ePaper
  * @param image_buffer pointer to the uint8_t image buffer
- * @note This function creates a virtual BMP header for E1002's 7-color display
- *       and processes the image data for optimal color rendering
+ * @return true if the image buffer was allocated, false otherwise
  */
 static void draw_virtual_bmp_from_png(const uint8_t *image_buffer)
 {
-    // Add error checking
-    if (!image_buffer) {
-        Log_error("E1002: Invalid image buffer for virtual BMP");
-        return;
-    }
-
     //currently only reTerminal E1002 is using the 7color ePaper, and it's using ESP32-S3, RAM is not an issue
     const unsigned char bmp_header[62] = {
         // BITMAPFILEHEADER (14 bytes)
@@ -803,39 +755,14 @@ static void draw_virtual_bmp_from_png(const uint8_t *image_buffer)
         0xFF, 0xFF, 0xFF, 0x00  // Color 1: White (B,G,R,0)
     };
     uint8_t *p_buff = (uint8_t *)malloc(DISPLAY_BMP_IMAGE_SIZE);
-    if (!p_buff) {
-        Log_error("E1002: Failed to allocate memory for virtual BMP");
-        return;
-    }
 
-    Log_info("E1002: Drawing virtual BMP from PNG for 7-color display");
+    Log_info("Draw virtual bmp from png...");
 
     memcpy(p_buff, bmp_header, 62);  // fillin a dummy header
     memcpy(p_buff + 62, image_buffer, DISPLAY_BMP_IMAGE_SIZE - 62);
     int ret = bbep.loadBMP(p_buff, 0, 0, BBEP_WHITE, BBEP_BLACK);  //loadBMP will handle bpp for the color ePaper
-    Log_verbose_serial("E1002: Virtual BMP load result: %d", ret);
+    Log_verbose_serial("load BMP decoded from PNG, ret: %d", ret);
     free(p_buff);
-}
-#endif
-
-/**
- * @brief E1002-specific test function to validate color mapping
- * @note This function tests the 7-color capabilities of the E1002 display
- */
-#if defined(BOARD_SEEED_RETERMINAL_E1002)
-void test_e1002_color_mapping() {
-    Log_info("E1002: Testing 7-color display capabilities");
-    
-    // Test color mapping array
-    uint8_t colorMap[E1002_COLOR_MAP_SIZE] = {0x0, 0x1, 0x2, 0x3, 0x4, 0x5, 0x6};
-    const char* colorNames[] = {"black", "white", "yellow", "red", "blue", "green", "orange"};
-    
-    Log_info("E1002: Available colors:");
-    for (int i = 0; i < E1002_COLOR_MAP_SIZE; i++) {
-        Log_info("  Color %d: %s (0x%02X)", i, colorNames[i], colorMap[i]);
-    }
-    
-    Log_info("E1002: Color mapping test completed");
 }
 #endif
 
